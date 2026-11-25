@@ -5,10 +5,19 @@ import * as store from './store.js';
 const BASE = 'https://apis.roblox.com';
 
 async function cloud(method, path, { body, headers = {}, raw = false } = {}) {
+  const groupCall = path.startsWith('/cloud/v2/groups/');
+  if (groupCall && !config.robloxGroupKey) {
+    const err = new Error(
+      'Booster ranking needs ROBLOX_GROUP_API_KEY in .env: a key made on your own Roblox account (not the group), ' +
+        'with groups → Read and Write, by someone who can change ranks.',
+    );
+    err.short = 'ROBLOX_GROUP_API_KEY not set';
+    throw err;
+  }
   const res = await fetch(BASE + path, {
     method,
     headers: {
-      'x-api-key': config.robloxApiKey,
+      'x-api-key': groupCall ? config.robloxGroupKey : config.robloxApiKey,
       ...(body !== undefined && !raw ? { 'content-type': 'application/json' } : {}),
       ...headers,
     },

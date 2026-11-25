@@ -35,6 +35,9 @@ export const config = {
   guildId: process.env.DISCORD_GUILD_ID?.trim(),
 
   robloxApiKey: process.env.ROBLOX_API_KEY?.trim(),
+  // roblox only lets *user* api keys change group ranks (not group keys), so booster ranking
+  // uses its own key: made on your account (you must be able to change ranks), group:read + group:write
+  robloxGroupKey: process.env.ROBLOX_GROUP_API_KEY?.trim(),
   universeId: process.env.ROBLOX_UNIVERSE_ID?.trim() || '4070239544',
   placeId: process.env.ROBLOX_PLACE_ID?.trim() || '11448102409',
 

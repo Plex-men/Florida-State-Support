@@ -679,7 +679,15 @@ export async function sweepBoosters(guild) {
   let changed = 0;
   try {
     const members = await loadMembers(guild);
-    if (!config.bloxlinkKey || !config.mainGroupId) return;
+    const missing = [
+      !config.bloxlinkKey && 'BLOXLINK_API_KEY',
+      !config.mainGroupId && 'MAIN_GROUP_ID',
+      !config.robloxGroupKey && 'ROBLOX_GROUP_API_KEY',
+    ].filter(Boolean);
+    if (missing.length) {
+      warn('boost', `booster ranking off, set ${missing.join(', ')} in .env`);
+      return;
+    }
     const check = async (id, work) => {
       checked++;
       try {

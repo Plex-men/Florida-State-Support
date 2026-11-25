@@ -8,6 +8,7 @@
   "scripts": {
     "start": "node src/index.js",
     "deploy": "node src/deploy.js",
+    "doctor": "node src/doctor.js",
     "check": "node --check src/index.js && node --check src/deploy.js && node --check src/roblox.js && node --check src/commands.js && node --check src/handlers.js && node --check src/config.js"
   },
   "dependencies": {
