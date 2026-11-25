@@ -12,6 +12,16 @@ function required(name) {
   return value;
 }
 
+function boostRanks(name, fallback) {
+  const raw = (process.env[name] ?? fallback ?? '').trim();
+  return raw
+    .split(',')
+    .map((pair) => pair.split(':').map((n) => Number(n.trim())))
+    .filter(([tier, rank]) => Number.isInteger(tier) && tier >= 1 && Number.isInteger(rank) && rank >= 1 && rank < 255)
+    .map(([tier, rank]) => ({ tier, rank }))
+    .sort((a, b) => a.tier - b.tier);
+}
+
 function ids(name) {
   return (process.env[name] || '')
     .split(',')
@@ -44,6 +54,13 @@ export const config = {
   bansStore: 'FSRPAdmin_Bans_v1',
   serverListMap: 'FSRP_ServerList',
   tempBanMaxSeconds: 7 * 86400,
+
+  bloxlinkKey: process.env.BLOXLINK_API_KEY?.trim(),
+  mainGroupId: Number(process.env.MAIN_GROUP_ID) || 0,
+
+  boostRanks: {
+    main: boostRanks('BOOST_RANKS_MAIN', '1:2'),
+  },
 };
 
 export function checkConfig({ forDeploy = false } = {}) {

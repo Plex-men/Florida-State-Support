@@ -7,13 +7,15 @@ import {
   TextInputBuilder,
   TextInputStyle,
   MessageFlags,
+  MessageType,
 } from 'discord.js';
 import { config } from './config.js';
 import * as roblox from './roblox.js';
+import * as store from './store.js';
+import { info, warn, error, short } from './log.js';
 
 const COLORS = { pending: 0xe25454, approved: 0x2ecc71, denied: 0x95a5a6, info: 0xf0f2f7, warn: 0xffd700, error: 0xe25454 };
 
-// every reply is an embed: card('ok' | 'info' | 'warn' | 'error', title, description?)
 export function card(kind, title, description) {
   const color = { ok: COLORS.approved, info: COLORS.info, warn: COLORS.warn, error: COLORS.error }[kind] ?? COLORS.info;
   const embed = new EmbedBuilder().setColor(color).setTitle(title).setFooter({ text: 'Florida State Roleplay' }).setTimestamp(new Date());
@@ -26,7 +28,6 @@ function done(interaction, kind, title, description) {
 }
 const REQ_TAG = 'FSRP-BANREQ';
 
-// Tiers match the in-game panel: 1 Staff, 2 Admin, 3 High, 4 Foundership
 export const TIERS = ['None', 'Staff', 'Admin', 'High', 'Foundership'];
 
 export function levelOf(member) {
@@ -38,7 +39,6 @@ export function levelOf(member) {
   return 0;
 }
 
-// Staff: moderation + ban requests. Admin: bans. High: announcements.
 const NEEDS = { banrequest: 1, baninfo: 1, servers: 1, findserver: 1, notes: 1, warn: 1, kick: 1, ban: 2, unban: 2, announce: 3 };
 
 export function lengthText(seconds) {
@@ -53,7 +53,6 @@ export function lengthText(seconds) {
   return parts.slice(0, 2).join(' ') || `${seconds}s`;
 }
 
-// "30m", "12h", "3d", "2w", "1mo", "1y", combos like "1d12h", "perm"; a plain number means days
 const UNITS = { s: 1, sec: 1, m: 60, min: 60, h: 3600, hr: 3600, d: 86400, day: 86400, days: 86400, w: 604800, wk: 604800, mo: 2592000, month: 2592000, y: 31536000, yr: 31536000 };
 export function parseDuration(text) {
   const t = String(text ?? '').toLowerCase().replace(/\s+/g, '');
@@ -70,7 +69,6 @@ export function parseDuration(text) {
   return total > 0 ? total : null;
 }
 
-// duration (typed) wins over length (preset); one of them is needed
 async function getSeconds(interaction) {
   const typed = interaction.options.getString('duration');
   if (typed) {
@@ -107,7 +105,7 @@ async function logToChannel(client, embed) {
     const channel = await client.channels.fetch(config.logChannelId);
     await channel?.send({ embeds: [embed], allowedMentions: { parse: [] } });
   } catch (err) {
-    console.warn('Log channel send failed:', err.message);
+    warn('log', `log channel: ${short(err)}`);
   }
 }
 
@@ -116,8 +114,6 @@ function fail(interaction, text) {
   return interaction.deferred || interaction.replied ? interaction.editReply(payload) : interaction.reply(payload);
 }
 
-// Actions (ban, unban, kick, warn, ban requests, adding notes) take a user ID only.
-// Lookups (baninfo, viewing notes) also accept a username.
 async function getUser(interaction, { idOnly = false } = {}) {
   const idInput = interaction.options.getString('userid');
   const raw = (idInput ?? interaction.options.getString('user') ?? '').trim();
@@ -263,7 +259,6 @@ export async function onCommand(interaction) {
     await roblox.unban(target.id);
     await Promise.allSettled([
       roblox.logUnban(target.id, staffName(interaction)),
-      // old Adonis bans (imported into the panel) are lifted too
       roblox.removeAdonisBan(target.id),
     ]);
     await logToChannel(
@@ -417,7 +412,6 @@ export async function onCommand(interaction) {
 
   if (name === 'notes') {
     const add = clean(interaction.options.getString('add'), 300);
-    // adding a note changes their record, so it needs the user ID
     const target = await getUser(interaction, { idOnly: !!add });
     if (!target) return;
     const record = add
@@ -532,4 +526,217 @@ if (message.channelId === config.helpChannelId && embed.title === 'Player needs 
       allowedMentions: { parse: [] },
     });
   }
+}
+
+const BOOST_MESSAGES = new Set([
+  MessageType.GuildBoost,
+  MessageType.GuildBoostTier1,
+  MessageType.GuildBoostTier2,
+  MessageType.GuildBoostTier3,
+]);
+
+const boostLocks = new Map();
+function withBoostLock(id, work) {
+  const run = (boostLocks.get(id) ?? Promise.resolve()).catch(() => {}).then(work);
+  boostLocks.set(id, run);
+  run.finally(() => boostLocks.get(id) === run && boostLocks.delete(id)).catch(() => {});
+  return run;
+}
+
+async function changeBoosts(discordId, change) {
+  const key = `boosts:${discordId}`;
+  const current = store.get(key);
+  const before = Number.isFinite(current?.count) ? current.count : 0;
+  const after = Math.max(0, Math.min(100, change(before)));
+  if (after !== before) {
+    if (after === 0) store.del(key);
+    else store.set(key, { count: after, updatedAt: Math.floor(Date.now() / 1000) });
+  }
+  return { before, after };
+}
+
+async function getBoostCount(discordId) {
+  const current = store.get(`boosts:${discordId}`);
+  return Number.isFinite(current?.count) ? current.count : 0;
+}
+
+function rankFor(map, count) {
+  let rank = null;
+  for (const step of map) if (count >= step.tier) rank = step.rank;
+  return rank;
+}
+
+async function syncGroup(groupId, map, link, count) {
+  if (!groupId || !map.length) return { groupId, text: null, state: link.boost?.[groupId] ?? null };
+  const label = 'Group';
+  let state = link.boost?.[groupId] ?? null;
+  try {
+    const roles = await roblox.groupRoles(groupId);
+    const byRank = new Map(roles.map((r) => [r.rank, r]));
+    const byPath = new Map(roles.map((r) => [r.path, r]));
+    const want = rankFor(map, count);
+    const wantRole = want === null ? null : byRank.get(want);
+    if (want !== null && !wantRole) return { groupId, text: `${label}: there's no role with rank ${want}.`, state };
+
+    const m = await roblox.groupMembership(groupId, link.userId);
+    if (!m) return { groupId, text: `${label}: not in the group yet (ranked on the next sync after they join).`, state };
+    const has = (path) => m.roles.includes(path);
+
+    const remove = async (path) => {
+      if (m.roles.length > 1) await roblox.unassignGroupRole(m.path, path);
+      else {
+        const back = (state?.previous && byPath.get(state.previous)) || roles.filter((r) => r.rank > 0).sort((a, b) => a.rank - b.rank)[0];
+        if (back) await roblox.setGroupRole(m.path, back.path);
+      }
+      m.roles = m.roles.filter((p) => p !== path);
+    };
+
+    if (state?.assigned && state.assigned !== wantRole?.path && has(state.assigned)) await remove(state.assigned);
+    if (!wantRole) return { groupId, text: state?.assigned ? `${label}: booster role removed.` : null, change: state?.assigned ? 'removed booster role' : null, state: null };
+
+    if (has(wantRole.path)) return { groupId, text: `${label}: already has ${wantRole.name}.`, state: state?.assigned === wantRole.path ? state : null };
+    const highest = Math.max(0, ...m.roles.map((p) => byPath.get(p)?.rank ?? 0));
+    if (highest > wantRole.rank) return { groupId, text: `${label}: ranked above ${wantRole.name}, left as is.`, state: null };
+
+    const previous = m.roles.length === 1 ? m.roles[0] : null;
+    await roblox.assignGroupRole(m.path, wantRole.path);
+    state = { assigned: wantRole.path, previous };
+    return { groupId, text: `${label}: given **${wantRole.name}**.`, change: `gave ${wantRole.name.toLowerCase()}`, state };
+  } catch (err) {
+    return { groupId, text: `${label}: couldn't change the rank (${err.message})`, failed: short(err), state };
+  }
+}
+
+const BOOST_GROUPS = () => [
+  [config.mainGroupId, config.boostRanks.main],
+];
+
+export async function syncBoostRanks(discordId, count) {
+  const robloxId = await roblox.bloxlinkRobloxId(discordId);
+  let link = await roblox.getLink(discordId);
+  if (link && link.userId !== robloxId) {
+    for (const [groupId, map] of BOOST_GROUPS()) await syncGroup(groupId, map, link, 0);
+    await roblox.removeLink(discordId);
+    link = null;
+  }
+  if (!robloxId) return null;
+  if (!link) {
+    if (count <= 0) return null;
+    link = await roblox.saveLink(discordId, { id: robloxId, name: String(robloxId) });
+  }
+  const results = [];
+  for (const [groupId, map] of BOOST_GROUPS()) results.push(await syncGroup(groupId, map, link, count));
+  const boost = {};
+  for (const r of results) if (r.state) boost[r.groupId] = r.state;
+  if (count <= 0 && Object.keys(boost).length === 0) {
+    await roblox.removeLink(discordId);
+  } else if (JSON.stringify(boost) !== JSON.stringify(link.boost ?? {})) {
+    await roblox.setLinkBoost(discordId, boost);
+  }
+  return {
+    link,
+    lines: results.map((r) => r.text).filter(Boolean),
+    changes: results.map((r) => r.change).filter(Boolean),
+    failed: results.map((r) => r.failed).filter(Boolean),
+  };
+}
+
+const who = (member) => member?.user?.username ?? member?.id ?? '?';
+
+async function boostAdded(client, member, count) {
+  try {
+    const res = await syncBoostRanks(member.id, count);
+    if (!res) info('boost', `${who(member)} boosted (${count}), not verified with bloxlink`);
+    else if (res.failed.length) error('boost', `${who(member)}: ${res.failed[0]}`);
+    else info('boost', `${who(member)} boosted (${count})${res.changes.length ? ', ' + res.changes.join(', ') : ''}`);
+  } catch (err) {
+    error('boost', `${who(member)}: ${short(err)}`);
+  }
+}
+
+let lastMemberFetch = 0;
+export async function loadMembers(guild) {
+  if (Date.now() - lastMemberFetch < 60 * 60 * 1000 && guild.members.cache.size > 1) return guild.members.cache;
+  try {
+    const members = await guild.members.fetch();
+    lastMemberFetch = Date.now();
+    info('bot', `loaded ${members.size} members`);
+    return guild.members.cache ?? members;
+  } catch (err) {
+    warn('bot', `member list skipped (${short(err)}), using cache`);
+  }
+  return guild.members.cache ?? new Map();
+}
+
+let sweeping = false;
+export async function sweepBoosters(guild) {
+  if (sweeping) return;
+  sweeping = true;
+  const pause = () => new Promise((r) => setTimeout(r, 300));
+  const failures = new Map();
+  const fail = (reason) => failures.set(reason, (failures.get(reason) ?? 0) + 1);
+  let checked = 0;
+  let changed = 0;
+  try {
+    const members = await loadMembers(guild);
+    if (!config.bloxlinkKey || !config.mainGroupId) return;
+    const check = async (id, work) => {
+      checked++;
+      try {
+        const res = await withBoostLock(id, work);
+        if (res?.failed.length) res.failed.forEach(fail);
+        if (res?.changes.length) {
+          changed++;
+          info('boost', `${who(members.get(id))}: ${res.changes.join(', ')}`);
+        }
+      } catch (err) {
+        fail(short(err));
+      }
+      await pause();
+    };
+    for (const m of members.values()) {
+      if (!m.premiumSince) continue;
+      const count = Math.max(1, await getBoostCount(m.id));
+      await check(m.id, () => syncBoostRanks(m.id, count));
+    }
+    for (const id of roblox.linkedDiscordIds()) {
+      if (members.get(id)?.premiumSince) continue;
+      await check(id, async () => {
+        await changeBoosts(id, () => 0);
+        return syncBoostRanks(id, 0);
+      });
+    }
+    if (checked) info('boost', `sync done, ${checked} checked, ${changed} changed`);
+    for (const [reason, n] of failures) error('boost', `${n} failed: ${reason}`);
+  } catch (err) {
+    error('boost', `sync failed: ${short(err)}`);
+  } finally {
+    sweeping = false;
+  }
+}
+
+export async function onBoostMessage(message) {
+  if (!BOOST_MESSAGES.has(message.type) || !message.author || message.author.bot) return;
+  const member = message.member ?? (await message.guild.members.fetch(message.author.id).catch(() => null));
+  if (!member) return;
+  const { after } = await withBoostLock(member.id, () => changeBoosts(member.id, (c) => c + 1));
+  await boostAdded(message.client, member, after);
+}
+
+export async function onGuildMemberUpdate(oldMember, newMember) {
+  const wasBoosting = !!oldMember?.premiumSince;
+  const isBoosting = !!newMember.premiumSince;
+  if (wasBoosting === isBoosting) return;
+
+  if (!isBoosting) {
+    await withBoostLock(newMember.id, () => changeBoosts(newMember.id, () => 0));
+    const res = await syncBoostRanks(newMember.id, 0).catch((err) => ({ failed: [short(err)], changes: [] }));
+    if (res?.failed.length) error('boost', `${who(newMember)} unboosted: ${res.failed[0]}`);
+    else info('boost', `${who(newMember)} unboosted${res?.changes.length ? ', ' + res.changes.join(', ') : ''}`);
+    return;
+  }
+
+  await new Promise((r) => setTimeout(r, 8000));
+  const { before, after } = await withBoostLock(newMember.id, () => changeBoosts(newMember.id, (c) => Math.max(c, 1)));
+  if (before === 0 && after === 1) await boostAdded(newMember.client, newMember, after);
 }

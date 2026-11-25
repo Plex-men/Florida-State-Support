@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { config } from './config.js';
+import * as store from './store.js';
 
 const BASE = 'https://apis.roblox.com';
 
@@ -16,7 +17,6 @@ async function cloud(method, path, { body, headers = {}, raw = false } = {}) {
   const text = await res.text();
   if (res.status === 404) return { status: 404, data: null };
   if (res.status === 401 || res.status === 403) {
-    // say which permission the Open Cloud key is missing instead of a raw 403
     const need = path.includes('memory-store')
       ? 'memory-store → Sorted Map: Read'
       : path.includes('user-restrictions')
@@ -24,19 +24,25 @@ async function cloud(method, path, { body, headers = {}, raw = false } = {}) {
         : path.includes('messaging-service')
           ? 'messaging-service → Publish'
           : path.includes('datastores')
-            ? 'universe-datastores → Read Entry, Create Entry, Update Entry'
+            ? 'universe-datastores → Read Entry, Create Entry, Update Entry, Delete Entry'
+            : path.includes('/groups/')
+              ? 'groups → Read and Write (the key must be created under the group, by someone who can change ranks)'
             : 'the permission for this API';
-    throw new Error(
+    const err = new Error(
       `The Roblox API key can't do this yet. In Creator Hub → Credentials, edit the key and add **${need}** ` +
         `for the FSRP experience (and check the key's IP list allows this machine).`,
     );
+    err.short = `roblox ${res.status}, key needs ${need.split(' →')[0]}`;
+    throw err;
   }
   if (!res.ok) {
     let message = text;
     try {
       message = JSON.parse(text).message || text;
     } catch {}
-    throw new Error(`Roblox said ${res.status}: ${String(message).slice(0, 300)}`);
+    const err = new Error(`Roblox said ${res.status}: ${String(message).slice(0, 300)}`);
+    err.short = `roblox ${res.status}: ${String(message).slice(0, 80).toLowerCase()}`;
+    throw err;
   }
   let data = null;
   if (text) {
@@ -154,6 +160,10 @@ export async function setEntry(store, key, value) {
   });
 }
 
+export async function deleteEntry(store, key) {
+  await cloud('DELETE', entryPath(store, key));
+}
+
 export async function updateEntry(store, key, change) {
   const current = (await getEntry(store, key)) ?? undefined;
   const next = change(current);
@@ -189,7 +199,6 @@ export async function logBan(entry) {
   });
 }
 
-// old Adonis bans, imported into FSRPAdmin_Bans_v1 key "adonis" as { "<userId>": { name, reason, by, untilT } }
 export async function getAdonisBan(userId) {
   const map = await getEntry(config.bansStore, 'adonis');
   const ban = map && typeof map === 'object' ? map[String(userId)] : null;
@@ -203,6 +212,125 @@ export async function removeAdonisBan(userId) {
   if (!map || typeof map !== 'object' || !(String(userId) in map)) return;
   delete map[String(userId)];
   await setEntry(config.bansStore, 'adonis', map);
+}
+
+const bloxCache = new Map();
+export async function bloxlinkRobloxId(discordId) {
+  if (!config.bloxlinkKey) return null;
+  const hit = bloxCache.get(discordId);
+  if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.id;
+  const res = await fetch(`https://api.blox.link/v4/public/guilds/${config.guildId}/discord-to-roblox/${discordId}`, {
+    headers: { Authorization: config.bloxlinkKey },
+  });
+  if (res.status === 401 || res.status === 403) throw new Error('Bloxlink rejected the API key (check BLOXLINK_API_KEY).');
+  let id = null;
+  if (res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const n = Number(data?.robloxID);
+    id = Number.isInteger(n) && n > 0 ? n : null;
+  } else if (res.status !== 404) {
+    throw new Error(`Bloxlink said ${res.status}`);
+  }
+  bloxCache.set(discordId, { at: Date.now(), id });
+  return id;
+}
+
+export async function listKeys(store, prefix = '') {
+  const keys = [];
+  let cursor = '';
+  do {
+    const { data } = await cloud(
+      'GET',
+      `/datastores/v1/universes/${config.universeId}/standard-datastores/datastore/entries` +
+        `?datastoreName=${encodeURIComponent(store)}&prefix=${encodeURIComponent(prefix)}&limit=100` +
+        (cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''),
+    );
+    for (const k of data?.keys ?? []) keys.push(k.key);
+    cursor = data?.nextPageCursor ?? '';
+  } while (cursor);
+  return keys;
+}
+
+const dKey = (discordId) => `link:d_${discordId}`;
+const rKey = (userId) => `link:r_${Number(userId)}`;
+
+export async function getLink(discordId) {
+  const link = store.get(dKey(discordId));
+  return link && typeof link === 'object' && Number.isFinite(link.userId) ? link : null;
+}
+
+export async function getLinkByRoblox(userId) {
+  const back = store.get(rKey(userId));
+  if (!back?.discordId) return null;
+  const link = await getLink(back.discordId);
+  return link && link.userId === Number(userId) ? { discordId: back.discordId, ...link } : null;
+}
+
+export async function saveLink(discordId, user, extra = {}) {
+  const back = store.get(rKey(user.id));
+  if (back?.discordId && back.discordId !== discordId) store.del(dKey(back.discordId));
+  const old = await getLink(discordId);
+  if (old && old.userId !== user.id) store.del(rKey(old.userId));
+  const link = { userId: user.id, name: user.name, linkedAt: Math.floor(Date.now() / 1000), boost: {}, ...extra };
+  store.set(dKey(discordId), link);
+  store.set(rKey(user.id), { discordId });
+  return link;
+}
+
+export async function setLinkBoost(discordId, boost) {
+  const link = await getLink(discordId);
+  if (link) store.set(dKey(discordId), { ...link, boost });
+  return link;
+}
+
+export async function removeLink(discordId) {
+  const link = await getLink(discordId);
+  if (!link) return null;
+  store.del(dKey(discordId));
+  if (store.get(rKey(link.userId))?.discordId === discordId) store.del(rKey(link.userId));
+  return link;
+}
+
+export function linkedDiscordIds() {
+  return store.keys('link:d_').map((k) => k.slice('link:d_'.length));
+}
+
+const roleCache = new Map();
+export async function groupRoles(groupId) {
+  const hit = roleCache.get(groupId);
+  if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.roles;
+  const roles = [];
+  let token = '';
+  do {
+    const { data } = await cloud(
+      'GET',
+      `/cloud/v2/groups/${groupId}/roles?maxPageSize=20${token ? `&pageToken=${encodeURIComponent(token)}` : ''}`,
+    );
+    for (const r of data?.groupRoles ?? []) roles.push({ path: r.path, id: r.id, name: r.displayName, rank: Number(r.rank) });
+    token = data?.nextPageToken ?? '';
+  } while (token);
+  roleCache.set(groupId, { at: Date.now(), roles });
+  return roles;
+}
+
+export async function groupMembership(groupId, userId) {
+  const filter = encodeURIComponent(`user == 'users/${Number(userId)}'`);
+  const { data } = await cloud('GET', `/cloud/v2/groups/${groupId}/memberships?maxPageSize=1&filter=${filter}`);
+  const m = data?.groupMemberships?.[0];
+  if (!m) return null;
+  return { path: m.path, role: m.role, roles: Array.isArray(m.roles) && m.roles.length ? m.roles : [m.role] };
+}
+
+export async function assignGroupRole(membershipPath, rolePath) {
+  await cloud('POST', `/cloud/v2/${membershipPath}:assignRole`, { body: { role: rolePath } });
+}
+
+export async function unassignGroupRole(membershipPath, rolePath) {
+  await cloud('POST', `/cloud/v2/${membershipPath}:unassignRole`, { body: { role: rolePath } });
+}
+
+export async function setGroupRole(membershipPath, rolePath) {
+  await cloud('PATCH', `/cloud/v2/${membershipPath}`, { body: { path: membershipPath, role: rolePath } });
 }
 
 export async function logUnban(userId, by) {
